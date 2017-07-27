@@ -204,6 +204,8 @@ type Server struct {
 	freeReq    *Request
 	respLock   sync.Mutex // protects freeResp
 	freeResp   *Response
+
+	sem chan struct{}
 }
 
 // NewServer returns a new Server.
@@ -548,9 +550,24 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 			}
 			continue
 		}
-		go service.call(ctx, server, sending, mtype, req, argv, replyv, codec)
+
+		if server.sem != nil {
+			server.sem <- struct{}{}
+		}
+		go func() {
+			defer func() {
+				if server.sem != nil {
+					<-server.sem
+				}
+			}()
+			service.call(ctx, server, sending, mtype, req, argv, replyv, codec)
+		}()
 	}
 	codec.Close()
+}
+
+func (server *Server) SetConcurrency(concurrency int) {
+	server.sem = make(chan struct{}, concurrency)
 }
 
 // ServeRequest is like ServeCodec but synchronously serves a single request.

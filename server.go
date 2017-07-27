@@ -136,6 +136,7 @@ type Server struct {
 	Timeout      time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	Concurrency  int
 	// use for KCP
 	KCPConfig KCPConfig
 }
@@ -455,4 +456,8 @@ func (s *Server) RegisterName(name string, service interface{}, metadata ...stri
 func (s *Server) Auth(fn AuthorizationFunc) error {
 	p := &AuthorizationServerPlugin{AuthorizationFunc: fn}
 	return s.PluginContainer.Add(p)
+}
+
+func (s *Server) SetConcurrency(concurrency int) {
+	s.rpcServer.SetConcurrency(concurrency)
 }
