@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"time"
 
 	msgpackrpc2 "github.com/rpcx-ecosystem/net-rpc-msgpackrpc2"
@@ -81,13 +83,17 @@ type DirectClientSelector struct {
 	DialTimeout      time.Duration
 	Client           *Client
 	rpcClient        *core.Client
+	sync.Mutex
 }
 
 //Select returns a rpc client.
 func (s *DirectClientSelector) Select(clientCodecFunc ClientCodecFunc, options ...interface{}) (*core.Client, error) {
+	s.Lock()
+	defer s.Unlock()
 	if s.rpcClient != nil {
 		return s.rpcClient, nil
 	}
+
 	c, err := NewDirectRPCClient(s.Client, clientCodecFunc, s.Network, s.Address, s.DialTimeout)
 	s.rpcClient = c
 	return c, err
@@ -112,8 +118,12 @@ func (s *DirectClientSelector) AllClients(clientCodecFunc ClientCodecFunc) []*co
 }
 
 func (s *DirectClientSelector) HandleFailedClient(client *core.Client) {
+	s.Lock()
 	client.Close()
-	s.rpcClient = nil // reset
+	if s.rpcClient == client {
+		s.rpcClient = nil // reset
+	}
+	s.Unlock()
 }
 
 // ClientCodecFunc is used to create a  core.ClientCodecFunc from net.Conn.
@@ -233,6 +243,10 @@ func (c *Client) clientBroadCast(ctx context.Context, serviceMethod string, args
 	l := len(rpcClients)
 	done := make(chan *core.Call, l)
 	for _, rpcClient := range rpcClients {
+		if rpcClient.IsShutdown() && Reconnect != nil {
+			log.Infof("client has been shutdown")
+			c.ClientSelector.HandleFailedClient(rpcClient)
+		}
 		rpcClient.Go(ctx, serviceMethod, args, reply, done)
 	}
 
@@ -262,6 +276,10 @@ func (c *Client) clientForking(ctx context.Context, serviceMethod string, args i
 	l := len(rpcClients)
 	done := make(chan *core.Call, l)
 	for _, rpcClient := range rpcClients {
+		if rpcClient.IsShutdown() && Reconnect != nil {
+			log.Infof("client has been shutdown")
+			c.ClientSelector.HandleFailedClient(rpcClient)
+		}
 		rpcClient.Go(ctx, serviceMethod, args, reply, done)
 	}
 
@@ -284,6 +302,11 @@ func (c *Client) clientForking(ctx context.Context, serviceMethod string, args i
 }
 
 func (c *Client) wrapCall(client *core.Client, ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
+	if client.IsShutdown() && Reconnect != nil {
+		log.Infof("client has been shutdown")
+		c.ClientSelector.HandleFailedClient(client)
+	}
+
 	c.PluginContainer.DoPreCall(ctx, serviceMethod, args, reply)
 	err := client.Call(ctx, serviceMethod, args, reply)
 	c.PluginContainer.DoPostCall(ctx, serviceMethod, args, reply)
@@ -304,8 +327,9 @@ func (c *Client) Auth(authorization, tag string) error {
 	return c.PluginContainer.Add(p)
 }
 
-type clientCodecWrapper struct {
+type ClientCodecWrapper struct {
 	core.ClientCodec
+	ClientCodecFunc
 	PluginContainer IClientPluginContainer
 	Timeout         time.Duration
 	ReadTimeout     time.Duration
@@ -313,12 +337,12 @@ type clientCodecWrapper struct {
 	Conn            net.Conn
 }
 
-// newClientCodecWrapper wraps a  core.ServerCodec.
-func newClientCodecWrapper(pc IClientPluginContainer, c core.ClientCodec, conn net.Conn) *clientCodecWrapper {
-	return &clientCodecWrapper{ClientCodec: c, PluginContainer: pc, Conn: conn}
+// newClientCodecWrapper wraps a  core.ClientCodec.
+func newClientCodecWrapper(pc IClientPluginContainer, c core.ClientCodec, conn net.Conn) *ClientCodecWrapper {
+	return &ClientCodecWrapper{ClientCodec: c, PluginContainer: pc, Conn: conn}
 }
 
-func (w *clientCodecWrapper) ReadRequestHeader(r *core.Response) error {
+func (w *ClientCodecWrapper) ReadRequestHeader(r *core.Response) error {
 	if w.Timeout > 0 {
 		w.Conn.SetDeadline(time.Now().Add(w.Timeout))
 	}
@@ -343,7 +367,7 @@ func (w *clientCodecWrapper) ReadRequestHeader(r *core.Response) error {
 	return w.PluginContainer.DoPostReadResponseHeader(r)
 }
 
-func (w *clientCodecWrapper) ReadRequestBody(body interface{}) error {
+func (w *ClientCodecWrapper) ReadRequestBody(body interface{}) error {
 	//pre
 	err := w.PluginContainer.DoPreReadResponseBody(body)
 	if err != nil {
@@ -361,7 +385,7 @@ func (w *clientCodecWrapper) ReadRequestBody(body interface{}) error {
 	return w.PluginContainer.DoPostReadResponseBody(body)
 }
 
-func (w *clientCodecWrapper) WriteRequest(ctx context.Context, r *core.Request, body interface{}) error {
+func (w *ClientCodecWrapper) WriteRequest(ctx context.Context, r *core.Request, body interface{}) error {
 	if w.Timeout > 0 {
 		w.Conn.SetDeadline(time.Now().Add(w.Timeout))
 	}
@@ -386,6 +410,53 @@ func (w *clientCodecWrapper) WriteRequest(ctx context.Context, r *core.Request, 
 	return w.PluginContainer.DoPostWriteRequest(ctx, r, body)
 }
 
-func (w *clientCodecWrapper) Close() error {
+func (w *ClientCodecWrapper) Close() error {
 	return w.ClientCodec.Close()
+}
+
+// ReconnectFunc recnnect function.
+type ReconnectFunc func(client *core.Client, clientAndServer map[string]*core.Client, rpcxClient *Client, dailTimeout time.Duration) bool
+
+// Reconnect strategy. The default reconnect is to reconnect at most 3 times.
+var Reconnect ReconnectFunc = reconnect
+
+//try to reconnect
+func reconnect(client *core.Client, clientAndServer map[string]*core.Client, rpcxClient *Client, dailTimeout time.Duration) (reconnected bool) {
+	var server string
+	for k, v := range clientAndServer {
+		if v == client {
+			server = k
+		}
+		break
+	}
+
+	if server != "" {
+		ss := strings.Split(server, "@")
+
+		var clientCodecFunc ClientCodecFunc
+		if wrapper, ok := client.Codec().(*ClientCodecWrapper); ok {
+			clientCodecFunc = wrapper.ClientCodecFunc
+		}
+
+		interval := 100 * time.Millisecond
+
+		if clientCodecFunc != nil {
+			for i := 0; i < 3; i++ {
+				c, err := NewDirectRPCClient(rpcxClient, clientCodecFunc, ss[0], ss[1], dailTimeout)
+				if err == nil {
+					// close this client
+					client.Close()
+					*client = *c
+					log.Warnf("reconnected to server: %s", server)
+					return true
+				}
+				log.Warnf("failed to reconnected to server: %s", server)
+				time.Sleep(interval)
+				interval = interval * 2
+			}
+
+		}
+	}
+
+	return false
 }

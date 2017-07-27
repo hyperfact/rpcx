@@ -212,6 +212,10 @@ func (s *ZooKeeperClientSelector) getCachedClient(server string, clientCodecFunc
 }
 
 func (s *ZooKeeperClientSelector) HandleFailedClient(client *core.Client) {
+	if rpcx.Reconnect != nil && rpcx.Reconnect(client, s.clientAndServer, s.Client, s.dailTimeout) {
+		return
+	}
+
 	for k, v := range s.clientAndServer {
 		if v == client {
 			s.clientRWMutex.Lock()

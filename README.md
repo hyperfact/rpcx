@@ -5,6 +5,9 @@
 [![License](https://img.shields.io/:license-apache-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![GoDoc](https://godoc.org/github.com/smallnest/rpcx?status.png)](http://godoc.org/github.com/smallnest/rpcx)  [![travis](https://travis-ci.org/smallnest/rpcx.svg?branch=master)](https://travis-ci.org/smallnest/rpcx) [![Go Report Card](https://goreportcard.com/badge/github.com/smallnest/rpcx)](https://goreportcard.com/report/github.com/smallnest/rpcx) [![QQ群](https://img.shields.io/:QQ群-398044387-blue.svg)](_documents/images/rpcx_qq.png)
 
 
+`go get -u -v github.com/smallnest/rpcx/...`
+
+
 rpcx is a distributed RPC framework like [Alibaba Dubbo](http://dubbo.io/) and [Weibo Motan](https://github.com/weibocom/motan).
 It is based on Go net/rpc and provides extra governance features.
 
@@ -266,7 +269,7 @@ BenchmarkRPCX_protobuf-16         100000             17234 ns/op             733
 
 ## Comparision with gRPC
 [gRPC](https://github.com/grpc/grpc-go) is the RPC framework by Google. It supports multiple programming lanaguage.
-I have compared three cases for prcx and gRPC. It shows rpcx is much better than gRPC.
+I have compared three cases for rpcx and gRPC. It shows rpcx is much better than gRPC.
 
 current gRPC version is 1.0.
 

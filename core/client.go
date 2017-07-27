@@ -10,10 +10,11 @@ import (
 	"encoding/gob"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/smallnest/rpcx/log"
 )
 
 // ServerError represents an error that has been returned from
@@ -52,6 +53,16 @@ type Client struct {
 	shutdown bool // server has told us to stop
 }
 
+// Codec gets client's ClientCodec
+func (c *Client) Codec() ClientCodec {
+	return c.codec
+}
+
+// IsShutdown return this client has been shutdown.
+func (c *Client) IsShutdown() bool {
+	return c.shutdown
+}
+
 // A ClientCodec implements writing of RPC requests and
 // reading of RPC responses for the client side of an RPC session.
 // The client calls WriteRequest to write a request to the connection
@@ -86,6 +97,10 @@ func (client *Client) send(ctx context.Context, call *Call) {
 	client.pending[seq] = call
 	client.mutex.Unlock()
 
+	if cseq, ok := ctx.Value(seqKey{}).(*uint64); ok {
+		*cseq = seq
+	}
+
 	// Encode and send the request.
 	client.request.Seq = seq
 	header, ok := FromContext(ctx)
@@ -111,6 +126,9 @@ func (client *Client) input() {
 	var response Response
 	for err == nil {
 		response = Response{}
+		if client.codec == nil {
+			break
+		}
 		err = client.codec.ReadResponseHeader(&response)
 		if err != nil {
 			break
@@ -168,8 +186,8 @@ func (client *Client) input() {
 	}
 	client.mutex.Unlock()
 	client.reqMutex.Unlock()
-	if debugLog && err != io.EOF && !closing {
-		log.Println("rpc: client protocol error:", err)
+	if DebugLog && err != io.EOF && !closing {
+		log.Info("rpc: client protocol error:", err)
 	}
 }
 
@@ -180,8 +198,8 @@ func (call *Call) done() {
 	default:
 		// We don't want to block here. It is the caller's responsibility to make
 		// sure the channel has enough buffer space. See comment in Go().
-		if debugLog {
-			log.Println("rpc: discarding Call reply due to insufficient Done chan capacity")
+		if DebugLog {
+			log.Info("rpc: discarding Call reply due to insufficient Done chan capacity")
 		}
 	}
 }
@@ -283,13 +301,35 @@ func Dial(network, address string) (*Client, error) {
 // shutting down, ErrShutdown is returned.
 func (client *Client) Close() error {
 	client.mutex.Lock()
+
+	for seq, call := range client.pending {
+		delete(client.pending, seq)
+		if call != nil {
+			call.Error = ErrShutdown
+			call.done()
+		}
+	}
+
+	if client.closing || client.shutdown {
+		client.mutex.Unlock()
+		return ErrShutdown
+	}
+
+	client.closing = true
+	client.mutex.Unlock()
+	return client.codec.Close()
+}
+
+func (client *Client) Release() error {
+	client.mutex.Lock()
 	if client.closing {
 		client.mutex.Unlock()
 		return ErrShutdown
 	}
 	client.closing = true
 	client.mutex.Unlock()
-	return client.codec.Close()
+
+	return nil
 }
 
 // Go invokes the function asynchronously. It returns the Call structure representing
@@ -319,15 +359,15 @@ func (client *Client) Go(ctx context.Context, serviceMethod string, args interfa
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
 func (client *Client) Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
+	seq := new(uint64)
+	ctx = context.WithValue(ctx, seqKey{}, seq)
 	Done := client.Go(ctx, serviceMethod, args, reply, make(chan *Call, 1)).Done
 
 	var err error
 	select {
 	case <-ctx.Done(): //cancel by context
-		client.mutex.Lock()
-		call := client.pending[client.seq]
-		delete(client.pending, client.seq)
-		client.mutex.Unlock()
+		call := client.pending[*seq]
+		delete(client.pending, *seq)
 		if call != nil {
 			call.Error = ctx.Err()
 			call.done()
